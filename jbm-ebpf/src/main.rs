@@ -8,18 +8,23 @@
 mod vmlinux;
 
 use aya_bpf::{
-    bindings::BPF_F_USER_STACK,
+    bindings::{BPF_F_USER_STACK, BPF_NOEXIST},
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_send_signal_thread,
     },
     macros::{kprobe, map, tracepoint},
-    maps::{HashMap, PerfEventArray, StackTrace},
+    maps::{HashMap, PerCpuArray, PerfEventArray, StackTrace},
     programs::{ProbeContext, TracePointContext},
 };
-use jbm_common::{BlockEvent, Config, STACK_STORAGE_SIZE, TASK_COMM_LEN};
+use jbm_common::{
+    BlockEvent, CollectionStats, Config, STACK_STORAGE_SIZE, TASK_COMM_LEN,
+};
 
 #[map(name = "START_TIMES")]
 static mut START_TIMES: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(10240, 0);
+
+#[map(name = "RATE_LIMIT_LOCK")]
+static mut RATE_LIMIT_LOCK: HashMap<u32, u8> = HashMap::<u32, u8>::with_max_entries(1, 0);
 
 #[map(name = "LAST_SAMPLE_TIME")]
 static mut LAST_SAMPLE_TIME: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(1, 0);
@@ -29,6 +34,9 @@ static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_STORAGE
 
 #[map(name = "EVENTS")]
 static mut EVENTS: PerfEventArray<BlockEvent> = PerfEventArray::new(0);
+
+#[map(name = "STATS")]
+static mut STATS: PerCpuArray<CollectionStats> = PerCpuArray::with_max_entries(1, 0);
 
 // The actual value is set at initialization phase by the control application
 #[no_mangle]
@@ -97,17 +105,45 @@ unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
     if offtime < config.min_block_us || offtime > config.max_block_us {
         return Ok(0);
     }
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        (*stats).eligible_intervals += 1;
+        (*stats).eligible_duration_us += offtime;
+    }
 
     // Rate limit before stack collection, perf-buffer output, and signal
     // delivery. This is the authoritative limiter: rejecting the matching
     // signal later would leave an emitted BPF event without its JVM stack.
+    // A BPF_NOEXIST insertion is an atomic, non-spinning try-lock across
+    // CPUs. Hold it only while checking and updating the global timestamp;
+    // expensive stack collection and signal delivery happen after release.
+    // A contended attempt is conservatively skipped and counted separately.
     let sample_key: u32 = 0;
-    if let Some(last_sample_time) = LAST_SAMPLE_TIME.get(&sample_key) {
-        if t_end <= *last_sample_time || t_end - *last_sample_time < config.sample_interval_ns {
-            return Ok(0);
+    if RATE_LIMIT_LOCK
+        .insert(&sample_key, &1, BPF_NOEXIST as u64)
+        .is_err()
+    {
+        if let Some(stats) = STATS.get_ptr_mut(0) {
+            (*stats).limiter_contention += 1;
         }
+        return Ok(0);
     }
-    LAST_SAMPLE_TIME.insert(&sample_key, &t_end, 0)?;
+    let too_soon = LAST_SAMPLE_TIME.get(&sample_key).is_some_and(|last_sample_time| {
+        t_end <= *last_sample_time || t_end - *last_sample_time < config.sample_interval_ns
+    });
+    if too_soon {
+        let _ = RATE_LIMIT_LOCK.remove(&sample_key);
+        if let Some(stats) = STATS.get_ptr_mut(0) {
+            (*stats).interval_rejections += 1;
+        }
+        return Ok(0);
+    }
+    let update_result = LAST_SAMPLE_TIME.insert(&sample_key, &t_end, 0);
+    let unlock_result = RATE_LIMIT_LOCK.remove(&sample_key);
+    update_result?;
+    unlock_result?;
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        (*stats).selected_intervals += 1;
+    }
 
     // create and submit an event
     // A stack-map failure must not suppress the interval or its JVM sample.
@@ -121,12 +157,25 @@ unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
         Ok(stack_id) => stack_id,
         Err(error) => error,
     };
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        if kernel_stack_id < 0 {
+            (*stats).kernel_stack_failures += 1;
+        }
+        if user_stack_id < 0 {
+            (*stats).user_stack_failures += 1;
+        }
+    }
 
     let name = match bpf_get_current_comm() {
         Ok(name) => name,
         Err(_) => [0; TASK_COMM_LEN],
     };
     let signal_result = bpf_send_signal_thread(27);
+    if signal_result != 0 {
+        if let Some(stats) = STATS.get_ptr_mut(0) {
+            (*stats).signal_failures += 1;
+        }
+    }
     let event = BlockEvent {
         pid,
         tgid,

@@ -27,5 +27,21 @@ pub struct BlockEvent {
     pub signal_result: i64,
 }
 
+#[cfg_attr(feature = "user", derive(Debug, Clone, Copy, Default))]
+#[repr(C)]
+pub struct CollectionStats {
+    pub eligible_intervals: u64,
+    pub eligible_duration_us: u64,
+    pub limiter_contention: u64,
+    pub interval_rejections: u64,
+    pub selected_intervals: u64,
+    pub kernel_stack_failures: u64,
+    pub user_stack_failures: u64,
+    pub signal_failures: u64,
+}
+
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Config {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CollectionStats {}

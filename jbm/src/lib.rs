@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use aya::{
     include_bytes_aligned,
     maps::{
-        perf::{AsyncPerfEventArray, AsyncPerfEventArrayBuffer},
-        MapData, StackTraceMap,
+        perf::{PerfEventArray, PerfEventArrayBuffer},
+        MapData, PerCpuArray, StackTraceMap,
     },
     programs::{kprobe::KProbeLinkId, trace_point::TracePointLinkId, KProbe, TracePoint},
     util::{kernel_symbols, online_cpus},
@@ -15,7 +15,7 @@ use aya::{
 };
 use bytes::BytesMut;
 use chrono::{Local, TimeZone};
-use jbm_common::{BlockEvent, Config, STACK_STORAGE_SIZE};
+use jbm_common::{BlockEvent, CollectionStats, Config, STACK_STORAGE_SIZE};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -58,6 +58,8 @@ pub struct Jbm<JvmStackP: JvmStackTraceProvider> {
     perf_watermarks: HashMap<u32, u64>,
     perf_reader_failure: Option<String>,
     lost_perf_events: u64,
+    emitted_intervals: u64,
+    matched_intervals: u64,
     stream: EventStream,
     jvm_stack_provider: JvmStackP,
     resume_link: Option<KProbeLinkId>,
@@ -107,10 +109,6 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
             .try_into()
             .context("get jbm kprobe program")?;
         program.load().context("load finish_task_switch kprobe")?;
-        let resume_link = program
-            .attach(finish_task_switch, 0)
-            .with_context(|| format!("attach kprobe to {finish_task_switch}"))?;
-
         let switch_out: &mut TracePoint = bpf
             .program_mut("record_switch_out")
             .expect("program 'record_switch_out'")
@@ -119,13 +117,8 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
         switch_out
             .load()
             .context("load sched_switch tracepoint program")?;
-        let switch_out_link = switch_out
-            .attach("sched", "sched_switch")
-            .context("attach sched_switch tracepoint program")?;
-
-        let mut perf_array =
-            AsyncPerfEventArray::try_from(bpf.take_map("EVENTS").expect("EVENTS map"))
-                .context("open BPF EVENTS map")?;
+        let mut perf_array = PerfEventArray::try_from(bpf.take_map("EVENTS").expect("EVENTS map"))
+            .context("open BPF EVENTS map")?;
 
         let (perf_event_sender, perf_event_receiver) = mpsc::channel(PERF_EVENT_CHANNEL_CAPACITY);
         let cpus = online_cpus().context("read online CPU list")?;
@@ -140,6 +133,21 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
         }
         drop(perf_event_sender);
 
+        // Enable producers only after every per-CPU perf ring has a reader.
+        // This keeps startup records from being selected by BPF before user
+        // space has somewhere to receive them.
+        let program: &mut KProbe = bpf.program_mut("jbm").expect("program 'jbm'").try_into()?;
+        let resume_link = program
+            .attach(finish_task_switch, 0)
+            .with_context(|| format!("attach kprobe to {finish_task_switch}"))?;
+        let switch_out: &mut TracePoint = bpf
+            .program_mut("record_switch_out")
+            .expect("program 'record_switch_out'")
+            .try_into()?;
+        let switch_out_link = switch_out
+            .attach("sched", "sched_switch")
+            .context("attach sched_switch tracepoint program")?;
+
         Ok(Self {
             bpf,
             perf_event_receiver,
@@ -147,6 +155,8 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
             perf_watermarks,
             perf_reader_failure: None,
             lost_perf_events: 0,
+            emitted_intervals: 0,
+            matched_intervals: 0,
             stream: EventStream::new(),
             jvm_stack_provider,
             resume_link: Some(resume_link),
@@ -169,7 +179,9 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
         self.jvm_stack_provider
             .fill_queue(&mut self.stream.jvm_events)
             .await?;
-        Ok(self.stream.sweep(self.correlation_watermark_ns()))
+        let results = self.stream.sweep(self.correlation_watermark_ns());
+        self.account_results(&results);
+        Ok(results)
     }
 
     pub async fn shutdown(&mut self) -> Result<Vec<(BpfEvent, Option<JvmEvent>)>> {
@@ -217,7 +229,50 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
                 self.lost_perf_events
             );
         }
-        Ok(self.stream.sweep_remaining())
+        let results = self.stream.sweep_remaining();
+        self.account_results(&results);
+        let stats = self.collection_stats()?;
+        info!(
+            "BPF coverage: eligible_intervals={}, eligible_duration_us={}, limiter_contention={}, interval_rejections={}, selected_intervals={}, received_intervals={}, matched_intervals={}, unmatched_intervals={}, kernel_stack_failures={}, user_stack_failures={}, signal_failures={}, perf_lost={}",
+            stats.eligible_intervals,
+            stats.eligible_duration_us,
+            stats.limiter_contention,
+            stats.interval_rejections,
+            stats.selected_intervals,
+            self.emitted_intervals,
+            self.matched_intervals,
+            self.emitted_intervals - self.matched_intervals,
+            stats.kernel_stack_failures,
+            stats.user_stack_failures,
+            stats.signal_failures,
+            self.lost_perf_events,
+        );
+        Ok(results)
+    }
+
+    fn account_results(&mut self, results: &[(BpfEvent, Option<JvmEvent>)]) {
+        self.emitted_intervals += results.len() as u64;
+        self.matched_intervals += results
+            .iter()
+            .filter(|(_, jvm_event)| jvm_event.is_some())
+            .count() as u64;
+    }
+
+    pub fn collection_stats(&self) -> Result<CollectionStats> {
+        let stats: PerCpuArray<&MapData, CollectionStats> =
+            PerCpuArray::try_from(self.bpf.map("STATS").expect("STATS map"))?;
+        let mut total = CollectionStats::default();
+        for value in stats.get(&0, 0)?.iter() {
+            total.eligible_intervals += value.eligible_intervals;
+            total.eligible_duration_us += value.eligible_duration_us;
+            total.limiter_contention += value.limiter_contention;
+            total.interval_rejections += value.interval_rejections;
+            total.selected_intervals += value.selected_intervals;
+            total.kernel_stack_failures += value.kernel_stack_failures;
+            total.user_stack_failures += value.user_stack_failures;
+            total.signal_failures += value.signal_failures;
+        }
+        Ok(total)
     }
 
     async fn receive_perf_events(&mut self, wait: Duration) -> Result<Vec<BlockEvent>> {
@@ -290,34 +345,28 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
 
 fn spawn_perf_reader(
     cpu: u32,
-    mut perf_buf: AsyncPerfEventArrayBuffer<MapData>,
+    mut perf_buf: PerfEventArrayBuffer<MapData>,
     sender: mpsc::Sender<PerfReaderMessage>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut read_bufs =
             vec![BytesMut::with_capacity(std::mem::size_of::<BlockEvent>()); PERF_EVENTS_PER_READ];
         loop {
-            // A progress timestamp is taken before polling. Once the poll
-            // returns fewer than the buffer capacity (or times out), all
+            // A progress timestamp is taken before reading. Once the direct
+            // ring read returns fewer than the buffer capacity, all
             // records whose end precedes this timestamp have been drained
             // from this CPU's ring and were sent before the watermark.
             let observed_through_ns = monotonic_time_ns();
-            let info = match tokio::time::timeout(
-                PERF_READER_HEARTBEAT_INTERVAL,
-                perf_buf.read_events(&mut read_bufs),
-            )
-            .await
-            {
-                Ok(Ok(info)) => Some(info),
-                Ok(Err(error)) => {
+            let info = match perf_buf.read_events(&mut read_bufs) {
+                Ok(info) => info,
+                Err(error) => {
                     let error = format!("{error:?}");
                     error!("Failed to poll eBPF buffer for CPU {}: {}", cpu, error);
                     let _ = sender.send(PerfReaderMessage::Failed { cpu, error }).await;
                     break;
                 }
-                Err(_) => None,
             };
-            let read = info.as_ref().map_or(0, |info| info.read);
+            let read = info.read;
             let events = read_bufs[..read]
                 .iter()
                 .map(|buf| {
@@ -332,7 +381,7 @@ fn spawn_perf_reader(
                     event
                 })
                 .collect();
-            let lost = info.as_ref().map_or(0, |info| info.lost as u64);
+            let lost = info.lost as u64;
             let ring_was_drained = read < PERF_EVENTS_PER_READ;
             if sender
                 .send(PerfReaderMessage::Progress {
@@ -349,6 +398,11 @@ fn spawn_perf_reader(
                 .is_err()
             {
                 break;
+            }
+            if read == 0 {
+                tokio::time::sleep(PERF_READER_HEARTBEAT_INTERVAL).await;
+            } else {
+                tokio::task::yield_now().await;
             }
         }
     })
@@ -559,7 +613,7 @@ impl EventStream {
             stacktrace: frames,
         };
         if let Some(tid) = tid {
-            self.bpf_events.entry(tid).or_default().push_back(bpf_event);
+            self.enqueue_bpf_event(tid, bpf_event);
         } else {
             self.unmatched_bpf_events.push_back(bpf_event);
         }
@@ -576,6 +630,22 @@ impl EventStream {
         }
 
         Ok(())
+    }
+
+    fn enqueue_bpf_event(&mut self, tid: u32, event: BpfEvent) {
+        let queue = self.bpf_events.entry(tid).or_default();
+        if queue
+            .back()
+            .map_or(true, |last| last.end_monotonic_ns <= event.end_monotonic_ns)
+        {
+            queue.push_back(event);
+            return;
+        }
+        let position = queue
+            .iter()
+            .position(|queued| queued.end_monotonic_ns > event.end_monotonic_ns)
+            .unwrap_or(queue.len());
+        queue.insert(position, event);
     }
 
     fn compute_timestamp(bpf_ktime: u64) -> u64 {
@@ -615,21 +685,26 @@ impl EventStream {
                     jvm_queue.len(),
                     tid
                 );
-                while jvm_queue
-                    .front()
-                    .is_some_and(|event| event.monotonic_timestamp_ns < bpf_event.end_monotonic_ns)
-                {
-                    Self::trash_jvm_event(&jvm_queue.pop_front().unwrap());
+                // Do not consume or discard a JVM sample until every CPU has
+                // drained BPF records through its timestamp. An older interval
+                // from this thread may still arrive from another CPU after a
+                // migration; enqueue_bpf_event will place it chronologically.
+                let mut waiting_for_watermark = false;
+                loop {
+                    match jvm_queue.front() {
+                        Some(event) if event.monotonic_timestamp_ns > correlation_watermark_ns => {
+                            waiting_for_watermark = true;
+                            break;
+                        }
+                        Some(event)
+                            if event.monotonic_timestamp_ns < bpf_event.end_monotonic_ns =>
+                        {
+                            Self::trash_jvm_event(&jvm_queue.pop_front().unwrap());
+                        }
+                        _ => break,
+                    }
                 }
-
-                // Do not correlate a JVM sample until every per-CPU reader has
-                // drained BPF records through the sample time. Otherwise a
-                // later interval from this thread can still be in a perf ring,
-                // and this sample could be attached to an older interval.
-                if jvm_queue
-                    .front()
-                    .is_some_and(|event| event.monotonic_timestamp_ns > correlation_watermark_ns)
-                {
+                if waiting_for_watermark {
                     break;
                 }
 
@@ -893,6 +968,98 @@ mod event_stream_tests {
         assert_eq!(result.len(), 2);
         assert!(result[0].1.is_none());
         assert!(result[1].1.is_some());
+    }
+
+    #[test]
+    fn orders_migrated_thread_events_arriving_from_different_cpu_readers() {
+        let mut later = bpf_event(1, 2);
+        later.end_monotonic_ns = 1_050;
+        let mut earlier = bpf_event(1, 1);
+        earlier.end_monotonic_ns = 1_000;
+        let first_sample = JvmEvent {
+            timestamp: 1,
+            monotonic_timestamp_ns: 1_010,
+            tid: 1,
+            thread_name: "thread-1".to_string(),
+            frames: Vec::new(),
+        };
+        let second_sample = JvmEvent {
+            timestamp: 2,
+            monotonic_timestamp_ns: 1_060,
+            tid: 1,
+            thread_name: "thread-1".to_string(),
+            frames: Vec::new(),
+        };
+        let mut stream = EventStream {
+            bpf_events: HashMap::from([(1, VecDeque::from([later]))]),
+            unmatched_bpf_events: VecDeque::new(),
+            event_count: 0,
+            jvm_events: HashMap::from([(1, VecDeque::from([first_sample, second_sample]))]),
+            ksyms: BTreeMap::new(),
+            symbol_resolver: Resolver::new(),
+            native_symbolization_unavailable: HashSet::new(),
+        };
+
+        assert!(stream.sweep(900).is_empty());
+        assert_eq!(stream.jvm_events.get(&1).unwrap().len(), 2);
+        stream.enqueue_bpf_event(1, earlier);
+
+        let result = stream.sweep(1_060);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0.end_monotonic_ns, 1_000);
+        assert_eq!(result[0].1.as_ref().unwrap().monotonic_timestamp_ns, 1_010);
+        assert_eq!(result[1].0.end_monotonic_ns, 1_050);
+        assert_eq!(result[1].1.as_ref().unwrap().monotonic_timestamp_ns, 1_060);
+    }
+
+    #[test]
+    fn rechecks_watermark_after_discarding_a_stale_jvm_sample() {
+        let base = monotonic_time_ns();
+        let mut first = bpf_event(1, 1);
+        first.end_monotonic_ns = base + 1_000;
+        let stale_sample = JvmEvent {
+            timestamp: 1,
+            monotonic_timestamp_ns: base + 900,
+            tid: 1,
+            thread_name: "thread-1".to_string(),
+            frames: Vec::new(),
+        };
+        let second_sample = JvmEvent {
+            timestamp: 2,
+            monotonic_timestamp_ns: base + 1_100,
+            tid: 1,
+            thread_name: "thread-1".to_string(),
+            frames: Vec::new(),
+        };
+        let mut stream = EventStream {
+            bpf_events: HashMap::from([(1, VecDeque::from([first]))]),
+            unmatched_bpf_events: VecDeque::new(),
+            event_count: 0,
+            jvm_events: HashMap::from([(1, VecDeque::from([stale_sample, second_sample]))]),
+            ksyms: BTreeMap::new(),
+            symbol_resolver: Resolver::new(),
+            native_symbolization_unavailable: HashSet::new(),
+        };
+
+        // The stale sample may be discarded, but the next sample is beyond
+        // the proven perf progress and must remain unconsumed.
+        assert!(stream.sweep(base + 950).is_empty());
+        assert_eq!(stream.jvm_events.get(&1).unwrap().len(), 1);
+        assert_eq!(stream.bpf_events.get(&1).unwrap().len(), 1);
+
+        let mut second = bpf_event(1, 2);
+        second.end_monotonic_ns = base + 1_050;
+        stream.enqueue_bpf_event(1, second);
+
+        let result = stream.sweep(base + 1_100);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0.end_monotonic_ns, base + 1_000);
+        assert!(result[0].1.is_none());
+        assert_eq!(result[1].0.end_monotonic_ns, base + 1_050);
+        assert_eq!(
+            result[1].1.as_ref().unwrap().monotonic_timestamp_ns,
+            base + 1_100
+        );
     }
 
     #[test]

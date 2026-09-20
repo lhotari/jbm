@@ -51,17 +51,18 @@ impl AsyncProfilerStackTraceProvider {
                     | libc::S_IWOTH,
             )
         };
-        let this = Self {
+        let mut this = Self {
             pid,
             profiler_cmd_path,
             profiler_library_path,
             output_file: tmpfile,
             output: file,
             pending: Vec::new(),
-            active: true,
+            active: false,
         };
 
         this.exec_profiler_cmd("start")?;
+        this.active = true;
         verify_shared_stream_file(pid, this.output_file.path())?;
         Ok(this)
     }

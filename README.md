@@ -55,6 +55,8 @@ guard: it sets the global minimum interval between samples triggered by
 qualifying events. The eBPF program applies it before collecting stacks,
 emitting an event, and sending a signal. Async-profiler accepts each signal so
 that an emitted eBPF event is not silently rejected by a second rate limiter.
+Concurrent CPUs use a non-spinning admission gate around the timestamp update;
+a contended attempt is conservatively skipped and reported separately.
 The default is 10 ms,
 limiting JBM to at most about 100 stack samples per second. Increase it when
 profiling production workloads where lower overhead matters more than resolving
@@ -75,6 +77,11 @@ auditable.
 Use `--quiet` for performance runs to avoid formatting and writing a verbose
 human-readable copy of every event to stdout. Raw and collapsed files are still
 written.
+
+Set `RUST_LOG=info` to retain the final coverage summary. It reports eligible,
+rate-rejected, selected, received, matched and unmatched interval counts, plus
+stack, signal and perf-ring failures. Treat a capture with unexplained
+selected/received differences or any transport loss as incomplete.
 
 Use `--async-profiler-lib` when the collector launcher and target JVM need
 different native builds, such as a glibc collector profiling a musl-based
