@@ -432,6 +432,7 @@ mod integration_tests {
             target_tgid: java_proc.id(),
             min_block_us: Duration::from_secs(1).as_micros() as u64,
             max_block_us: Duration::from_secs(10).as_micros() as u64,
+            sample_interval_ns: Duration::from_millis(10).as_nanos() as u64,
             stack_storage_size: 10240,
         };
 

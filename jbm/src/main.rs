@@ -6,6 +6,7 @@ use log::info;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::signal;
 
 const DEFAULT_ASYNC_PROFILER_BIN: &str = "./async-profiler/build/bin/asprof";
@@ -29,12 +30,12 @@ struct Cli {
     skip_jvm_stack: bool,
     #[arg(long)]
     async_profiler_bin: Option<String>,
-    /// Minimum interval between JVM stack samples accepted from blocking events.
+    /// Minimum interval between samples accepted from blocking events.
     ///
-    /// This bounds profiling overhead independently of min-block-time, which
-    /// controls which blocking events JBM observes.
-    #[arg(long, default_value = "10ms")]
-    sample_interval: String,
+    /// This rate limits stack collection, event output, and JVM stack walking
+    /// independently of min-block-time, which selects qualifying events.
+    #[arg(long, default_value = "10ms", value_parser = parse_duration)]
+    sample_interval: Duration,
 }
 
 #[tokio::main]
@@ -47,6 +48,11 @@ async fn main() -> Result<(), anyhow::Error> {
         target_tgid: cli.pid,
         min_block_us: cli.min_block_time,
         max_block_us: cli.max_block_time,
+        sample_interval_ns: cli
+            .sample_interval
+            .as_nanos()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("sample interval is too large"))?,
         stack_storage_size: cli.stack_storage_size,
     };
 
@@ -54,7 +60,7 @@ async fn main() -> Result<(), anyhow::Error> {
         config.target_tgid,
         cli.async_profiler_bin
             .unwrap_or_else(|| DEFAULT_ASYNC_PROFILER_BIN.to_string()),
-        cli.sample_interval,
+        humantime::format_duration(cli.sample_interval).to_string(),
     )
     .await?;
     let mut jbm = Jbm::new(config, async_profiler)?;
@@ -103,6 +109,14 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("Exiting...");
 
     Ok(())
+}
+
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let duration = humantime::parse_duration(value).map_err(|error| error.to_string())?;
+    if duration.is_zero() {
+        return Err("duration must be positive".to_string());
+    }
+    Ok(duration)
 }
 
 fn has_done<F: Future<Output = std::io::Result<()>>>(f: Pin<&mut F>) -> bool {

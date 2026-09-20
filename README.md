@@ -46,10 +46,13 @@ jbm -p TARGET_JVM_PID \
 
 `--min-block-time` and `--max-block-time` select blocking events by their
 duration, in microseconds. `--sample-interval` is an independent overhead
-guard: it sets the global minimum interval between JVM stack walks triggered by
-qualifying events. The default is 10 ms, limiting JBM to at most about 100 JVM
-stack samples per second. Increase it when profiling production workloads where
-lower overhead matters more than resolving every blocking event.
+guard: it sets the global minimum interval between samples triggered by
+qualifying events. The eBPF program applies it before collecting stacks,
+emitting an event, and sending a signal. Async-profiler enforces it again before
+walking the JVM stack when events race across CPUs. The default is 10 ms,
+limiting JBM to at most about 100 stack samples per second. Increase it when
+profiling production workloads where lower overhead matters more than resolving
+every blocking event.
 
 # How it works
 

@@ -23,6 +23,9 @@ use vmlinux::{pid_t, task_struct};
 #[map(name = "START_TIMES")]
 static mut START_TIMES: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(10240, 0);
 
+#[map(name = "LAST_SAMPLE_TIME")]
+static mut LAST_SAMPLE_TIME: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(1, 0);
+
 #[map(name = "STACK_TRACES")]
 static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_STORAGE_SIZE as u32, 0);
 
@@ -35,6 +38,7 @@ static CONFIG: Config = Config {
     target_tgid: 0,
     min_block_us: 0,
     max_block_us: 0,
+    sample_interval_ns: 0,
     stack_storage_size: 0,
 };
 
@@ -84,6 +88,17 @@ unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
     if offtime < config.min_block_us || offtime > config.max_block_us {
         return Ok(0);
     }
+
+    // Rate limit before stack collection, perf-buffer output, and signal
+    // delivery. The async-profiler side enforces the same limit atomically as
+    // a final guard when events race on different CPUs.
+    let sample_key: u32 = 0;
+    if let Some(last_sample_time) = LAST_SAMPLE_TIME.get(&sample_key) {
+        if t_end <= *last_sample_time || t_end - *last_sample_time < config.sample_interval_ns {
+            return Ok(0);
+        }
+    }
+    LAST_SAMPLE_TIME.insert(&sample_key, &t_end, 0)?;
 
     // create and submit an event
     let kernel_stack_id = STACK_TRACES.get_stackid(&ctx, 0)?;

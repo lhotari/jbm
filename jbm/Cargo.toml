@@ -10,6 +10,7 @@ aya-log = { git = "https://github.com/aya-rs/aya", rev = "58f1ecbf0089194d729327
 jbm-common = { path = "../jbm-common", features = ["user"] }
 anyhow = "1"
 env_logger = "0.10"
+humantime = "2"
 log = "0.4"
 tokio = { version = "1.25", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "io-util", "fs", "time"] }
 libc = "0.2.144"
