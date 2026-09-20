@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::signal;
 
-const DEFAULT_ASYNC_PROFILER_BIN: &'static str = "./async-profiler/profiler.sh";
+const DEFAULT_ASYNC_PROFILER_BIN: &str = "./async-profiler/build/bin/asprof";
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -29,6 +29,12 @@ struct Cli {
     skip_jvm_stack: bool,
     #[arg(long)]
     async_profiler_bin: Option<String>,
+    /// Minimum interval between JVM stack samples accepted from blocking events.
+    ///
+    /// This bounds profiling overhead independently of min-block-time, which
+    /// controls which blocking events JBM observes.
+    #[arg(long, default_value = "10ms")]
+    sample_interval: String,
 }
 
 #[tokio::main]
@@ -48,6 +54,7 @@ async fn main() -> Result<(), anyhow::Error> {
         config.target_tgid,
         cli.async_profiler_bin
             .unwrap_or_else(|| DEFAULT_ASYNC_PROFILER_BIN.to_string()),
+        cli.sample_interval,
     )
     .await?;
     let mut jbm = Jbm::new(config, async_profiler)?;

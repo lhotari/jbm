@@ -437,7 +437,8 @@ mod integration_tests {
 
         let async_profiler = AsyncProfilerStackTraceProvider::start(
             config.target_tgid,
-            "../async-profiler/profiler.sh".to_string(),
+            "../async-profiler/build/bin/asprof".to_string(),
+            "10ms".to_string(),
         )
         .await?;
 

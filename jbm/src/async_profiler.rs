@@ -12,12 +12,17 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 pub struct AsyncProfilerStackTraceProvider {
     pid: u32,
     profiler_cmd_path: String,
+    sample_interval: String,
     output_file: NamedTempFile,
     lines: Lines<BufReader<File>>,
 }
 
 impl AsyncProfilerStackTraceProvider {
-    pub async fn start(pid: u32, profiler_cmd_path: String) -> Result<Self, anyhow::Error> {
+    pub async fn start(
+        pid: u32,
+        profiler_cmd_path: String,
+        sample_interval: String,
+    ) -> Result<Self, anyhow::Error> {
         let tmpfile = Builder::new().prefix("jbm-ap-").tempfile()?;
         let file = File::open(tmpfile.path()).await?;
         let reader = BufReader::new(file);
@@ -37,6 +42,7 @@ impl AsyncProfilerStackTraceProvider {
         let this = Self {
             pid,
             profiler_cmd_path,
+            sample_interval,
             output_file: tmpfile,
             lines: reader.lines(),
         };
@@ -48,11 +54,13 @@ impl AsyncProfilerStackTraceProvider {
     fn exec_profiler_cmd(&self, subcommand: &str) -> Result<(), anyhow::Error> {
         let args = &[
             "-e",
-            "none",
+            "signal",
             "-o",
-            "stream",
+            "jsonl",
             "-f",
             &self.output_file.path().to_string_lossy().to_string(),
+            "-i",
+            &self.sample_interval,
             subcommand,
             &format!("{}", self.pid),
         ];
