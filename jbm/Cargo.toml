@@ -12,7 +12,7 @@ anyhow = "1"
 env_logger = "0.10"
 humantime = "2"
 log = "0.4"
-tokio = { version = "1.25", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "io-util", "fs", "time"] }
+tokio = { version = "1.25", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "io-util", "fs", "sync", "time"] }
 libc = "0.2.144"
 bytes = "1.4.0"
 chrono = "0.4.24"

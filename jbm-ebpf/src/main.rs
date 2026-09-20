@@ -10,15 +10,13 @@ mod vmlinux;
 use aya_bpf::{
     bindings::BPF_F_USER_STACK,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read,
-        bpf_send_signal_thread,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_send_signal_thread,
     },
-    macros::{kprobe, map},
+    macros::{kprobe, map, tracepoint},
     maps::{HashMap, PerfEventArray, StackTrace},
-    programs::ProbeContext,
+    programs::{ProbeContext, TracePointContext},
 };
 use jbm_common::{BlockEvent, Config, STACK_STORAGE_SIZE};
-use vmlinux::{pid_t, task_struct};
 
 #[map(name = "START_TIMES")]
 static mut START_TIMES: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(10240, 0);
@@ -50,20 +48,31 @@ pub fn jbm(ctx: ProbeContext) -> u32 {
     }
 }
 
-unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
-    let prev: *const task_struct = ctx.arg(0).ok_or(1u32)?;
-    let prev_pid = bpf_probe_read(&(*prev).pid as *const pid_t)?;
-    let prev_tgid = bpf_probe_read(&(*prev).tgid as *const pid_t)?;
+#[tracepoint(name = "record_switch_out")]
+pub fn record_switch_out(ctx: TracePointContext) -> u32 {
+    match unsafe { try_record_switch_out(ctx) } {
+        Ok(ret) => ret,
+        Err(ret) => ret as u32,
+    }
+}
 
+unsafe fn try_record_switch_out(_ctx: TracePointContext) -> Result<u32, i64> {
+    // sched_switch runs in the outgoing task's context, so helpers provide the
+    // outgoing PID/TGID without reading version-dependent task_struct fields.
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = pid_tgid as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+    let config = core::ptr::read_volatile(&CONFIG);
+    if tgid == config.target_tgid {
+        START_TIMES.insert(&pid, &bpf_ktime_get_ns(), 0)?;
+    }
+    Ok(0)
+}
+
+unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
     let config = core::ptr::read_volatile(&CONFIG);
 
-    // record previous thread sleep time
-    if prev_tgid as u32 == config.target_tgid {
-        let ts = bpf_ktime_get_ns();
-        START_TIMES.insert(&(prev_pid as u32), &ts, 0)?;
-    }
-
-    // get the current thread's start time
+    // finish_task_switch runs in the incoming task's context.
     let pid = bpf_get_current_pid_tgid() as u32;
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let t_start = if let Some(tsp) = START_TIMES.get(&pid) {
@@ -90,8 +99,8 @@ unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
     }
 
     // Rate limit before stack collection, perf-buffer output, and signal
-    // delivery. The async-profiler side enforces the same limit atomically as
-    // a final guard when events race on different CPUs.
+    // delivery. This is the authoritative limiter: rejecting the matching
+    // signal later would leave an emitted BPF event without its JVM stack.
     let sample_key: u32 = 0;
     if let Some(last_sample_time) = LAST_SAMPLE_TIME.get(&sample_key) {
         if t_end <= *last_sample_time || t_end - *last_sample_time < config.sample_interval_ns {
@@ -101,9 +110,19 @@ unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
     LAST_SAMPLE_TIME.insert(&sample_key, &t_end, 0)?;
 
     // create and submit an event
-    let kernel_stack_id = STACK_TRACES.get_stackid(&ctx, 0)?;
-    let user_stack_id = STACK_TRACES.get_stackid(&ctx, BPF_F_USER_STACK as u64)?;
+    // A stack-map failure must not suppress the interval or its JVM sample.
+    // Preserve the negative BPF error in the event so user space can account
+    // for the missing native stack independently.
+    let kernel_stack_id = match STACK_TRACES.get_stackid(&ctx, 0) {
+        Ok(stack_id) => stack_id,
+        Err(error) => error,
+    };
+    let user_stack_id = match STACK_TRACES.get_stackid(&ctx, BPF_F_USER_STACK as u64) {
+        Ok(stack_id) => stack_id,
+        Err(error) => error,
+    };
 
+    let signal_result = bpf_send_signal_thread(27);
     let event = BlockEvent {
         pid,
         tgid,
@@ -113,11 +132,9 @@ unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
         offtime,
         t_start,
         t_end,
+        signal_result,
     };
     EVENTS.output(&ctx, &event, 0);
-
-    // Signal target thread for taking call trace
-    bpf_send_signal_thread(27);
 
     Ok(0)
 }

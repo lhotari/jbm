@@ -24,6 +24,7 @@ pub struct BlockEvent {
     pub offtime: u64,
     pub t_start: u64,
     pub t_end: u64,
+    pub signal_result: i64,
 }
 
 #[cfg(feature = "user")]
