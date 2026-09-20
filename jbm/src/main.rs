@@ -32,6 +32,9 @@ struct Cli {
     /// Write JVM off-CPU stacks in collapsed format, weighted in microseconds.
     #[arg(long)]
     collapsed_output: Option<String>,
+    /// Suppress human-readable event output on stdout.
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
     #[arg(long, default_value_t = false)]
     skip_jvm_stack: bool,
     #[arg(long)]
@@ -96,7 +99,12 @@ async fn main() -> Result<(), anyhow::Error> {
             info!("Quitting as the target pid {} no longer alive", cli.pid);
             break;
         }
-        write_events(jbm.process().await?, &mut raw_output, &mut collapsed_output)?;
+        write_events(
+            jbm.process().await?,
+            &mut raw_output,
+            &mut collapsed_output,
+            !cli.quiet,
+        )?;
     }
 
     info!("Exiting...");
@@ -104,6 +112,7 @@ async fn main() -> Result<(), anyhow::Error> {
         jbm.shutdown().await?,
         &mut raw_output,
         &mut collapsed_output,
+        !cli.quiet,
     )?;
 
     if let Some(output) = raw_output.as_mut() {
@@ -120,6 +129,7 @@ fn write_events(
     events: Vec<(BpfEvent, Option<JvmEvent>)>,
     raw_output: &mut Option<BufWriter<File>>,
     collapsed_output: &mut Option<BufWriter<File>>,
+    print_events: bool,
 ) -> std::io::Result<()> {
     for (bpf_event, jvm_event) in events {
         if let Some(output) = raw_output.as_mut() {
@@ -139,12 +149,18 @@ fn write_events(
                 collapsed_sample(&bpf_event, jvm_event.as_ref())
             )?;
         }
+        if !print_events {
+            continue;
+        }
         let mut out = format!(
             "=== {} {} PID: {}, TID: {} ({}), DURATION: {} us\n",
             format_time(bpf_event.timestamp),
             bpf_event.timestamp,
             bpf_event.pid,
-            bpf_event.tid,
+            bpf_event
+                .tid
+                .map(|tid| tid.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
             bpf_event.comm,
             bpf_event.duration.as_micros(),
         );
@@ -239,7 +255,7 @@ mod tests {
             timestamp: 0,
             pid: 1,
             host_tid: 2,
-            tid: 2,
+            tid: Some(2),
             comm: "worker".to_string(),
             duration: Duration::from_micros(123),
             start_monotonic_ns: 0,

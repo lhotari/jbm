@@ -16,7 +16,7 @@ use aya_bpf::{
     maps::{HashMap, PerfEventArray, StackTrace},
     programs::{ProbeContext, TracePointContext},
 };
-use jbm_common::{BlockEvent, Config, STACK_STORAGE_SIZE};
+use jbm_common::{BlockEvent, Config, STACK_STORAGE_SIZE, TASK_COMM_LEN};
 
 #[map(name = "START_TIMES")]
 static mut START_TIMES: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(10240, 0);
@@ -122,13 +122,17 @@ unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
         Err(error) => error,
     };
 
+    let name = match bpf_get_current_comm() {
+        Ok(name) => name,
+        Err(_) => [0; TASK_COMM_LEN],
+    };
     let signal_result = bpf_send_signal_thread(27);
     let event = BlockEvent {
         pid,
         tgid,
         user_stack_id,
         kernel_stack_id,
-        name: bpf_get_current_comm()?,
+        name,
         offtime,
         t_start,
         t_end,

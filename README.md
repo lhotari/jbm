@@ -44,6 +44,7 @@ jbm -p TARGET_JVM_PID \
   --sample-interval 10ms \
   --output offcpu.jsonl \
   --collapsed-output offcpu.collapsed \
+  --quiet \
   --async-profiler-lib /path/visible/in/target/libasyncProfiler.so \
   --async-profiler-stream-dir /path/shared/by/collector/and/target
 ```
@@ -70,6 +71,10 @@ JVM-visible thread identifiers, monotonic start and end timestamps, duration,
 native stack, and optional correlated JVM stack. Keep this raw output alongside
 the collapsed file so correlation and measurement-window policies remain
 auditable.
+
+Use `--quiet` for performance runs to avoid formatting and writing a verbose
+human-readable copy of every event to stdout. Raw and collapsed files are still
+written.
 
 Use `--async-profiler-lib` when the collector launcher and target JVM need
 different native builds, such as a glibc collector profiling a musl-based

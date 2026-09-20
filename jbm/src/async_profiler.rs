@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use log::{debug, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::Command;
 use tempfile::{Builder, NamedTempFile};
 use tokio::fs::File;
@@ -60,6 +62,7 @@ impl AsyncProfilerStackTraceProvider {
         };
 
         this.exec_profiler_cmd("start")?;
+        verify_shared_stream_file(pid, this.output_file.path())?;
         Ok(this)
     }
 
@@ -151,6 +154,33 @@ fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn verify_shared_stream_file(pid: u32, collector_path: &Path) -> Result<(), anyhow::Error> {
+    let target_path = Path::new(&format!("/proc/{pid}/root")).join(
+        collector_path
+            .strip_prefix("/")
+            .map_err(|_| anyhow::anyhow!("async-profiler stream path must be absolute"))?,
+    );
+    let collector_metadata = std::fs::metadata(collector_path)?;
+    let target_metadata = std::fs::metadata(&target_path).map_err(|error| {
+        anyhow::anyhow!(
+            "async-profiler stream {} is not visible at the same path in target process {}: {}",
+            collector_path.display(),
+            pid,
+            error
+        )
+    })?;
+    if collector_metadata.dev() != target_metadata.dev()
+        || collector_metadata.ino() != target_metadata.ino()
+    {
+        return Err(anyhow::anyhow!(
+            "async-profiler stream {} resolves to a different file in target process {}",
+            collector_path.display(),
+            pid
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +197,12 @@ mod tests {
             vec![br#"{"timestamp":1}"#.to_vec(), b"second".to_vec()]
         );
         assert_eq!(pending, b"partial");
+    }
+
+    #[test]
+    fn verifies_a_stream_shared_with_the_current_process() {
+        let stream = tempfile::NamedTempFile::new().unwrap();
+        verify_shared_stream_file(std::process::id(), stream.path()).unwrap();
     }
 }
 

@@ -19,7 +19,7 @@ use jbm_common::{BlockEvent, Config, STACK_STORAGE_SIZE};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::CStr,
     fs,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -33,18 +33,30 @@ const STACK_STORAGE_SIZE_CHECK_COUNT: usize = 100;
 const PERF_EVENTS_PER_READ: usize = 64;
 const PERF_EVENT_CHANNEL_CAPACITY: usize = 256;
 const PERF_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PERF_READER_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+const PERF_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct PerfEventBatch {
-    events: Vec<BlockEvent>,
-    lost: u64,
+enum PerfReaderMessage {
+    Progress {
+        cpu: u32,
+        observed_through_ns: u64,
+        events: Vec<BlockEvent>,
+        lost: u64,
+    },
+    Failed {
+        cpu: u32,
+        error: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
 pub struct Jbm<JvmStackP: JvmStackTraceProvider> {
     bpf: Bpf,
-    perf_event_receiver: mpsc::Receiver<PerfEventBatch>,
+    perf_event_receiver: mpsc::Receiver<PerfReaderMessage>,
     perf_readers: Vec<JoinHandle<()>>,
+    perf_watermarks: HashMap<u32, u64>,
+    perf_reader_failure: Option<String>,
     lost_perf_events: u64,
     stream: EventStream,
     jvm_stack_provider: JvmStackP,
@@ -116,12 +128,15 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
                 .context("open BPF EVENTS map")?;
 
         let (perf_event_sender, perf_event_receiver) = mpsc::channel(PERF_EVENT_CHANNEL_CAPACITY);
+        let cpus = online_cpus().context("read online CPU list")?;
         let mut perf_readers = Vec::new();
-        for cpu in online_cpus().context("read online CPU list")? {
+        let mut perf_watermarks = HashMap::with_capacity(cpus.len());
+        for cpu in cpus {
             let perf_buf = perf_array
                 .open(cpu, None)
                 .with_context(|| format!("open BPF perf event buffer for CPU {cpu}"))?;
             perf_readers.push(spawn_perf_reader(cpu, perf_buf, perf_event_sender.clone()));
+            perf_watermarks.insert(cpu, 0);
         }
         drop(perf_event_sender);
 
@@ -129,6 +144,8 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
             bpf,
             perf_event_receiver,
             perf_readers,
+            perf_watermarks,
+            perf_reader_failure: None,
             lost_perf_events: 0,
             stream: EventStream::new(),
             jvm_stack_provider,
@@ -146,13 +163,13 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
     }
 
     pub async fn process(&mut self) -> Result<Vec<(BpfEvent, Option<JvmEvent>)>> {
-        let bpf_events = self.receive_perf_events(PERF_EVENT_POLL_INTERVAL).await;
+        let bpf_events = self.receive_perf_events(PERF_EVENT_POLL_INTERVAL).await?;
         self.add_bpf_events(bpf_events)?;
 
         self.jvm_stack_provider
             .fill_queue(&mut self.stream.jvm_events)
             .await?;
-        Ok(self.stream.sweep())
+        Ok(self.stream.sweep(self.correlation_watermark_ns()))
     }
 
     pub async fn shutdown(&mut self) -> Result<Vec<(BpfEvent, Option<JvmEvent>)>> {
@@ -172,13 +189,23 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
                 .try_into()?;
             program.detach(link)?;
         }
-        // Let readers drain records already committed to the per-CPU rings, then
-        // cancel their blocking reads and consume everything delivered so far.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let detached_at_ns = monotonic_time_ns();
+        let drain_deadline = tokio::time::Instant::now() + PERF_SHUTDOWN_DRAIN_TIMEOUT;
+        while self.correlation_watermark_ns() < detached_at_ns {
+            if tokio::time::Instant::now() >= drain_deadline {
+                return Err(anyhow!(
+                    "timed out draining per-CPU perf readers after BPF detach"
+                ));
+            }
+            let bpf_events = self
+                .receive_perf_events(PERF_READER_HEARTBEAT_INTERVAL)
+                .await?;
+            self.add_bpf_events(bpf_events)?;
+        }
         for reader in self.perf_readers.drain(..) {
             reader.abort();
         }
-        let bpf_events = self.receive_perf_events(Duration::ZERO).await;
+        let bpf_events = self.receive_perf_events(Duration::ZERO).await?;
         self.add_bpf_events(bpf_events)?;
         self.jvm_stack_provider.stop().await?;
         self.jvm_stack_provider
@@ -193,25 +220,51 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
         Ok(self.stream.sweep_remaining())
     }
 
-    async fn receive_perf_events(&mut self, wait: Duration) -> Vec<BlockEvent> {
+    async fn receive_perf_events(&mut self, wait: Duration) -> Result<Vec<BlockEvent>> {
         let mut events = Vec::new();
         if !wait.is_zero() {
             if let Ok(Some(batch)) =
                 tokio::time::timeout(wait, self.perf_event_receiver.recv()).await
             {
-                self.append_perf_batch(batch, &mut events);
+                self.append_perf_message(batch, &mut events);
             }
         }
-        while let Ok(batch) = self.perf_event_receiver.try_recv() {
-            self.append_perf_batch(batch, &mut events);
+        while let Ok(message) = self.perf_event_receiver.try_recv() {
+            self.append_perf_message(message, &mut events);
+        }
+        if let Some(error) = self.perf_reader_failure.take() {
+            return Err(anyhow!(error));
         }
         events.sort_unstable_by_key(|event| event.t_end);
-        events
+        Ok(events)
     }
 
-    fn append_perf_batch(&mut self, batch: PerfEventBatch, events: &mut Vec<BlockEvent>) {
-        self.lost_perf_events += batch.lost;
-        events.extend(batch.events);
+    fn append_perf_message(&mut self, message: PerfReaderMessage, events: &mut Vec<BlockEvent>) {
+        match message {
+            PerfReaderMessage::Progress {
+                cpu,
+                observed_through_ns,
+                events: batch_events,
+                lost,
+            } => {
+                self.lost_perf_events += lost;
+                if observed_through_ns != 0 {
+                    self.perf_watermarks
+                        .entry(cpu)
+                        .and_modify(|watermark| *watermark = (*watermark).max(observed_through_ns))
+                        .or_insert(observed_through_ns);
+                }
+                events.extend(batch_events);
+            }
+            PerfReaderMessage::Failed { cpu, error } => {
+                self.perf_reader_failure =
+                    Some(format!("perf reader for CPU {cpu} failed: {error}"));
+            }
+        }
+    }
+
+    fn correlation_watermark_ns(&self) -> u64 {
+        self.perf_watermarks.values().copied().min().unwrap_or(0)
     }
 
     fn add_bpf_events(&mut self, events: Vec<BlockEvent>) -> Result<()> {
@@ -238,22 +291,34 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
 fn spawn_perf_reader(
     cpu: u32,
     mut perf_buf: AsyncPerfEventArrayBuffer<MapData>,
-    sender: mpsc::Sender<PerfEventBatch>,
+    sender: mpsc::Sender<PerfReaderMessage>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut read_bufs =
+            vec![BytesMut::with_capacity(std::mem::size_of::<BlockEvent>()); PERF_EVENTS_PER_READ];
         loop {
-            let mut read_bufs = vec![
-                BytesMut::with_capacity(std::mem::size_of::<BlockEvent>());
-                PERF_EVENTS_PER_READ
-            ];
-            let info = match perf_buf.read_events(&mut read_bufs).await {
-                Ok(info) => info,
-                Err(error) => {
-                    error!("Failed to poll eBPF buffer for CPU {}: {:?}", cpu, error);
+            // A progress timestamp is taken before polling. Once the poll
+            // returns fewer than the buffer capacity (or times out), all
+            // records whose end precedes this timestamp have been drained
+            // from this CPU's ring and were sent before the watermark.
+            let observed_through_ns = monotonic_time_ns();
+            let info = match tokio::time::timeout(
+                PERF_READER_HEARTBEAT_INTERVAL,
+                perf_buf.read_events(&mut read_bufs),
+            )
+            .await
+            {
+                Ok(Ok(info)) => Some(info),
+                Ok(Err(error)) => {
+                    let error = format!("{error:?}");
+                    error!("Failed to poll eBPF buffer for CPU {}: {}", cpu, error);
+                    let _ = sender.send(PerfReaderMessage::Failed { cpu, error }).await;
                     break;
                 }
+                Err(_) => None,
             };
-            let events = read_bufs[..info.read]
+            let read = info.as_ref().map_or(0, |info| info.read);
+            let events = read_bufs[..read]
                 .iter()
                 .map(|buf| {
                     let mut event: BlockEvent = unsafe { std::mem::zeroed() };
@@ -267,10 +332,18 @@ fn spawn_perf_reader(
                     event
                 })
                 .collect();
+            let lost = info.as_ref().map_or(0, |info| info.lost as u64);
+            let ring_was_drained = read < PERF_EVENTS_PER_READ;
             if sender
-                .send(PerfEventBatch {
+                .send(PerfReaderMessage::Progress {
+                    cpu,
+                    observed_through_ns: if ring_was_drained {
+                        observed_through_ns
+                    } else {
+                        0
+                    },
                     events,
-                    lost: info.lost as u64,
+                    lost,
                 })
                 .await
                 .is_err()
@@ -356,7 +429,9 @@ pub struct BpfEvent {
     pub timestamp: u64,
     pub pid: u32,
     pub host_tid: u32,
-    pub tid: u32,
+    /// Thread ID as seen by the target JVM, or `None` if the host-to-target
+    /// PID namespace translation could not be completed.
+    pub tid: Option<u32>,
     pub comm: String,
     pub duration: Duration,
     pub start_monotonic_ns: u64,
@@ -367,19 +442,23 @@ pub struct BpfEvent {
 
 pub struct EventStream {
     bpf_events: HashMap<u32, VecDeque<BpfEvent>>,
+    unmatched_bpf_events: VecDeque<BpfEvent>,
     event_count: usize,
     jvm_events: HashMap<u32, VecDeque<JvmEvent>>,
     ksyms: BTreeMap<u64, String>,
     symbol_resolver: Resolver,
+    native_symbolization_unavailable: HashSet<u32>,
 }
 
 impl EventStream {
     pub fn new() -> Self {
         Self {
             bpf_events: HashMap::new(),
+            unmatched_bpf_events: VecDeque::new(),
             jvm_events: HashMap::new(),
             ksyms: kernel_symbols().expect("kernel symbols"),
             symbol_resolver: Resolver::new(),
+            native_symbolization_unavailable: HashSet::new(),
             event_count: 0,
         }
     }
@@ -419,19 +498,27 @@ impl EventStream {
                         .iter()
                         .map(|f| f.ip as usize)
                         .collect::<Vec<_>>();
-                    let user_frames = self
-                        .symbol_resolver
-                        .resolve(event.tgid, &user_addresses)
-                        .unwrap_or_else(|error| {
-                            warn!(
-                                "Unable to symbolize native user stack for process {}: {}",
-                                event.tgid, error
-                            );
-                            user_addresses
-                                .iter()
-                                .map(|address| (*address as u64, None))
-                                .collect()
-                        });
+                    let unresolved_frames = || {
+                        user_addresses
+                            .iter()
+                            .map(|address| (*address as u64, None))
+                            .collect::<Vec<_>>()
+                    };
+                    let user_frames = if self.native_symbolization_unavailable.contains(&event.tgid)
+                    {
+                        unresolved_frames()
+                    } else {
+                        self.symbol_resolver
+                            .resolve(event.tgid, &user_addresses)
+                            .unwrap_or_else(|error| {
+                                self.native_symbolization_unavailable.insert(event.tgid);
+                                warn!(
+                                    "Unable to symbolize native user stacks for process {}: {}",
+                                    event.tgid, error
+                                );
+                                unresolved_frames()
+                            })
+                    };
                     for (addr, symbol) in user_frames {
                         frames.push((addr, symbol.unwrap_or("[unknown symbol name]".to_string())));
                     }
@@ -450,13 +537,15 @@ impl EventStream {
             .to_string();
 
         let timestamp = Self::compute_timestamp(event.t_end);
-        let tid = namespace_tid(event.tgid, event.pid).unwrap_or_else(|error| {
-            warn!(
-                "Unable to translate host TID {} for process {}: {}",
-                event.pid, event.tgid, error
-            );
-            event.pid
-        });
+        let tid = namespace_tid(event.tgid, event.pid)
+            .map(Some)
+            .unwrap_or_else(|error| {
+                warn!(
+                    "Unable to translate host TID {} for process {}: {}",
+                    event.pid, event.tgid, error
+                );
+                None
+            });
         let bpf_event = BpfEvent {
             timestamp,
             pid: event.tgid,
@@ -469,10 +558,11 @@ impl EventStream {
             signal_result: event.signal_result,
             stacktrace: frames,
         };
-        self.bpf_events
-            .entry(tid)
-            .or_insert_with(|| VecDeque::new())
-            .push_back(bpf_event);
+        if let Some(tid) = tid {
+            self.bpf_events.entry(tid).or_default().push_back(bpf_event);
+        } else {
+            self.unmatched_bpf_events.push_back(bpf_event);
+        }
 
         self.event_count += 1;
         if self.event_count % STACK_STORAGE_SIZE_CHECK_COUNT == 0 {
@@ -505,11 +595,15 @@ impl EventStream {
         timestamp
     }
 
-    pub fn sweep(&mut self) -> Vec<(BpfEvent, Option<JvmEvent>)> {
+    pub fn sweep(&mut self, correlation_watermark_ns: u64) -> Vec<(BpfEvent, Option<JvmEvent>)> {
         let now_monotonic_ns = monotonic_time_ns();
 
         let mut empty = VecDeque::with_capacity(0);
-        let mut ret: Vec<(BpfEvent, Option<JvmEvent>)> = Vec::new();
+        let mut ret: Vec<(BpfEvent, Option<JvmEvent>)> = self
+            .unmatched_bpf_events
+            .drain(..)
+            .map(|event| (event, None))
+            .collect();
         let mut tids = self.bpf_events.keys().copied().collect::<Vec<_>>();
         tids.sort_unstable();
         for tid in tids {
@@ -526,6 +620,17 @@ impl EventStream {
                     .is_some_and(|event| event.monotonic_timestamp_ns < bpf_event.end_monotonic_ns)
                 {
                     Self::trash_jvm_event(&jvm_queue.pop_front().unwrap());
+                }
+
+                // Do not correlate a JVM sample until every per-CPU reader has
+                // drained BPF records through the sample time. Otherwise a
+                // later interval from this thread can still be in a perf ring,
+                // and this sample could be attached to an older interval.
+                if jvm_queue
+                    .front()
+                    .is_some_and(|event| event.monotonic_timestamp_ns > correlation_watermark_ns)
+                {
+                    break;
                 }
 
                 let has_newer_candidate = bpf_queue.get(1).is_some_and(|next| {
@@ -564,7 +669,7 @@ impl EventStream {
     }
 
     fn sweep_remaining(&mut self) -> Vec<(BpfEvent, Option<JvmEvent>)> {
-        let mut result = self.sweep();
+        let mut result = self.sweep(u64::MAX);
         let mut tids = self.bpf_events.keys().copied().collect::<Vec<_>>();
         tids.sort_unstable();
         for tid in tids {
@@ -659,7 +764,7 @@ mod event_stream_tests {
             timestamp,
             pid: 1,
             host_tid: tid,
-            tid,
+            tid: Some(tid),
             comm: format!("thread-{tid}"),
             duration: Duration::from_millis(1),
             start_monotonic_ns: 0,
@@ -677,6 +782,7 @@ mod event_stream_tests {
                 (1, VecDeque::from([bpf_event(1, old_timestamp)])),
                 (2, VecDeque::from([bpf_event(2, old_timestamp + 80)])),
             ]),
+            unmatched_bpf_events: VecDeque::new(),
             event_count: 0,
             jvm_events: HashMap::from([(
                 1,
@@ -690,13 +796,14 @@ mod event_stream_tests {
             )]),
             ksyms: BTreeMap::new(),
             symbol_resolver: Resolver::new(),
+            native_symbolization_unavailable: HashSet::new(),
         };
 
-        let result = stream.sweep();
+        let result = stream.sweep(u64::MAX);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0.tid, 1);
+        assert_eq!(result[0].0.tid, Some(1));
         assert_eq!(result[0].1.as_ref().map(|event| event.tid), Some(1));
-        assert_eq!(result[1].0.tid, 2);
+        assert_eq!(result[1].0.tid, Some(2));
         assert!(result[1].1.is_none());
     }
 
@@ -741,16 +848,71 @@ mod event_stream_tests {
         };
         let mut stream = EventStream {
             bpf_events: HashMap::from([(1, VecDeque::from([first, second]))]),
+            unmatched_bpf_events: VecDeque::new(),
             event_count: 0,
             jvm_events: HashMap::from([(1, VecDeque::from([sample]))]),
             ksyms: BTreeMap::new(),
             symbol_resolver: Resolver::new(),
+            native_symbolization_unavailable: HashSet::new(),
         };
 
-        let result = stream.sweep();
+        let result = stream.sweep(u64::MAX);
         assert_eq!(result.len(), 2);
         assert!(result[0].1.is_none());
         assert!(result[1].1.is_some());
+    }
+
+    #[test]
+    fn waits_for_perf_watermark_before_correlating_a_sample() {
+        let sample_time = monotonic_time_ns();
+        let mut first = bpf_event(1, 1);
+        first.end_monotonic_ns = sample_time - 2_000;
+        let sample = JvmEvent {
+            timestamp: 3,
+            monotonic_timestamp_ns: sample_time,
+            tid: 1,
+            thread_name: "thread-1".to_string(),
+            frames: Vec::new(),
+        };
+        let mut stream = EventStream {
+            bpf_events: HashMap::from([(1, VecDeque::from([first]))]),
+            unmatched_bpf_events: VecDeque::new(),
+            event_count: 0,
+            jvm_events: HashMap::from([(1, VecDeque::from([sample]))]),
+            ksyms: BTreeMap::new(),
+            symbol_resolver: Resolver::new(),
+            native_symbolization_unavailable: HashSet::new(),
+        };
+
+        assert!(stream.sweep(sample_time - 1).is_empty());
+
+        let mut second = bpf_event(1, 2);
+        second.end_monotonic_ns = sample_time - 1_000;
+        stream.bpf_events.get_mut(&1).unwrap().push_back(second);
+        let result = stream.sweep(sample_time);
+        assert_eq!(result.len(), 2);
+        assert!(result[0].1.is_none());
+        assert!(result[1].1.is_some());
+    }
+
+    #[test]
+    fn emits_an_untranslated_thread_without_attempting_a_match() {
+        let mut event = bpf_event(7, 1);
+        event.tid = None;
+        let mut stream = EventStream {
+            bpf_events: HashMap::new(),
+            unmatched_bpf_events: VecDeque::from([event]),
+            event_count: 0,
+            jvm_events: HashMap::new(),
+            ksyms: BTreeMap::new(),
+            symbol_resolver: Resolver::new(),
+            native_symbolization_unavailable: HashSet::new(),
+        };
+
+        let result = stream.sweep(u64::MAX);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].0.tid.is_none());
+        assert!(result[0].1.is_none());
     }
 }
 
@@ -813,7 +975,7 @@ mod integration_tests {
 
         let (bpf_event, jvm_event) = find_event(&events, "LOCKER").unwrap();
 
-        assert_ne!(java_proc.id(), bpf_event.tid);
+        assert_ne!(Some(java_proc.id()), bpf_event.tid);
         assert_eq!(java_proc.id(), bpf_event.pid);
         assert_eq!("LOCKER", bpf_event.comm);
         assert!(
@@ -827,7 +989,7 @@ mod integration_tests {
             .is_some());
 
         let jvm_event = jvm_event.unwrap();
-        assert_eq!(bpf_event.tid, jvm_event.tid);
+        assert_eq!(bpf_event.tid, Some(jvm_event.tid));
         assert!(jvm_event
             .frames
             .iter()
