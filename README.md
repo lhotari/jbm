@@ -68,6 +68,20 @@ so it can be rendered with FlameGraph tools. Events without a matching JVM
 sample are retained under a `[no JVM stack]` frame, preserving their duration
 in the profile total.
 
+The bundled async-profiler converter renders the collapsed output as an
+interactive off-CPU Flame Graph. Label the duration counter explicitly because
+collapsed files do not carry unit metadata:
+
+```sh
+async-profiler/build/bin/jfrconv \
+  --units us \
+  --title "JVM off-CPU duration" \
+  offcpu.collapsed offcpu.html
+```
+
+The graph represents the duration of the intervals admitted by JBM's global
+sampling policy. It must not be interpreted as the JVM's aggregate blocked time.
+
 `--output` preserves each selected interval as JSONL, including its host and
 JVM-visible thread identifiers, monotonic start and end timestamps, duration,
 native stack, and optional correlated JVM stack. Keep this raw output alongside
