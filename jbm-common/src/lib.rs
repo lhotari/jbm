@@ -9,7 +9,8 @@ pub struct Config {
     pub target_tgid: u32,
     pub min_block_us: u64,
     pub max_block_us: u64,
-    pub sample_interval_ns: u64,
+    /// Accept random u32 values below this threshold; 2^32 selects every event.
+    pub sample_threshold: u64,
     pub stack_storage_size: u32,
 }
 
@@ -32,8 +33,7 @@ pub struct BlockEvent {
 pub struct CollectionStats {
     pub eligible_intervals: u64,
     pub eligible_duration_us: u64,
-    pub limiter_contention: u64,
-    pub interval_rejections: u64,
+    pub probability_rejections: u64,
     pub selected_intervals: u64,
     pub kernel_stack_failures: u64,
     pub user_stack_failures: u64,

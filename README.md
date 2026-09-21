@@ -41,7 +41,7 @@ cargo build --release
 jbm -p TARGET_JVM_PID \
   --min-block-time 1000000 \
   --max-block-time 60000000 \
-  --sample-interval 10ms \
+  --sample-probability 0.001 \
   --output offcpu.jsonl \
   --collapsed-output offcpu.collapsed \
   --quiet \
@@ -49,18 +49,14 @@ jbm -p TARGET_JVM_PID \
   --async-profiler-stream-dir /path/shared/by/collector/and/target
 ```
 
-`--min-block-time` and `--max-block-time` select blocking events by their
-duration, in microseconds. `--sample-interval` is an independent overhead
-guard: it sets the global minimum interval between samples triggered by
-qualifying events. The eBPF program applies it before collecting stacks,
-emitting an event, and sending a signal. Async-profiler accepts each signal so
-that an emitted eBPF event is not silently rejected by a second rate limiter.
-Concurrent CPUs use a non-spinning admission gate around the timestamp update;
-a contended attempt is conservatively skipped and reported separately.
-The default is 10 ms,
-limiting JBM to at most about 100 stack samples per second. Increase it when
-profiling production workloads where lower overhead matters more than resolving
-every blocking event.
+`--min-block-time` and `--max-block-time` select completed off-CPU intervals by
+their duration in microseconds. `--sample-probability` independently selects each
+qualifying interval with a probability between 0 and 1 (default 0.001, or 0.1%).
+Zero captures none; one captures all qualifying intervals. The kernel performs
+selection before stack collection, event output, and signaling the JVM. No global
+rate-limiter lock is used. Capture volume grows with workload, so a probability is
+not a maximum samples-per-second limit. Async-profiler accepts every signal;
+selection happens only in JBM so a second filter cannot discard matching stacks.
 
 `--collapsed-output` writes correlated JVM stacks in the standard collapsed
 format. Each line is weighted by the event's off-CPU duration in microseconds,
@@ -79,8 +75,11 @@ async-profiler/build/bin/jfrconv \
   offcpu.collapsed offcpu.html
 ```
 
-The graph represents the duration of the intervals admitted by JBM's global
-sampling policy. It must not be interpreted as the JVM's aggregate blocked time.
+The graph represents the duration of the intervals selected by JBM's event-probability
+sampling policy. Raw weights are not extrapolated. Dividing by the effective
+probability estimates duration for qualifying completed intervals only, assuming
+no capture loss; it does not include waits excluded by the duration filters or
+waits that have not completed. The threshold is quantized to 1 / 2^32.
 
 `--output` preserves each selected interval as JSONL, including its host and
 JVM-visible thread identifiers, monotonic start and end timestamps, duration,
@@ -93,7 +92,7 @@ human-readable copy of every event to stdout. Raw and collapsed files are still
 written.
 
 Set `RUST_LOG=info` to retain the final coverage summary. It reports eligible,
-rate-rejected, selected, received, matched and unmatched interval counts, plus
+probability-rejected, selected, received, matched and unmatched interval counts, plus
 stack, signal and perf-ring failures. Treat a capture with unexplained
 selected/received differences or any transport loss as incomplete.
 

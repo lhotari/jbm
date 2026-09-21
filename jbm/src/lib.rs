@@ -233,11 +233,10 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
         self.account_results(&results);
         let stats = self.collection_stats()?;
         info!(
-            "BPF coverage: eligible_intervals={}, eligible_duration_us={}, limiter_contention={}, interval_rejections={}, selected_intervals={}, received_intervals={}, matched_intervals={}, unmatched_intervals={}, kernel_stack_failures={}, user_stack_failures={}, signal_failures={}, perf_lost={}",
+            "BPF coverage: eligible_intervals={}, eligible_duration_us={}, probability_rejections={}, selected_intervals={}, received_intervals={}, matched_intervals={}, unmatched_intervals={}, kernel_stack_failures={}, user_stack_failures={}, signal_failures={}, perf_lost={}",
             stats.eligible_intervals,
             stats.eligible_duration_us,
-            stats.limiter_contention,
-            stats.interval_rejections,
+            stats.probability_rejections,
             stats.selected_intervals,
             self.emitted_intervals,
             self.matched_intervals,
@@ -265,8 +264,7 @@ impl<JvmStackP: JvmStackTraceProvider + Send> Jbm<JvmStackP> {
         for value in stats.get(&0, 0)?.iter() {
             total.eligible_intervals += value.eligible_intervals;
             total.eligible_duration_us += value.eligible_duration_us;
-            total.limiter_contention += value.limiter_contention;
-            total.interval_rejections += value.interval_rejections;
+            total.probability_rejections += value.probability_rejections;
             total.selected_intervals += value.selected_intervals;
             total.kernel_stack_failures += value.kernel_stack_failures;
             total.user_stack_failures += value.user_stack_failures;
@@ -1123,7 +1121,7 @@ mod integration_tests {
             target_tgid: java_proc.id(),
             min_block_us: Duration::from_secs(1).as_micros() as u64,
             max_block_us: Duration::from_secs(10).as_micros() as u64,
-            sample_interval_ns: Duration::from_millis(10).as_nanos() as u64,
+            sample_threshold: 4_294_967_296,
             stack_storage_size: 10240,
         };
 

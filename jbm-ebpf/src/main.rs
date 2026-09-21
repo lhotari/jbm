@@ -8,9 +8,10 @@
 mod vmlinux;
 
 use aya_bpf::{
-    bindings::{BPF_F_USER_STACK, BPF_NOEXIST},
+    bindings::BPF_F_USER_STACK,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_send_signal_thread,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_prandom_u32, bpf_ktime_get_ns,
+        bpf_send_signal_thread,
     },
     macros::{kprobe, map, tracepoint},
     maps::{HashMap, PerCpuArray, PerfEventArray, StackTrace},
@@ -22,12 +23,6 @@ use jbm_common::{
 
 #[map(name = "START_TIMES")]
 static mut START_TIMES: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(10240, 0);
-
-#[map(name = "RATE_LIMIT_LOCK")]
-static mut RATE_LIMIT_LOCK: HashMap<u32, u8> = HashMap::<u32, u8>::with_max_entries(1, 0);
-
-#[map(name = "LAST_SAMPLE_TIME")]
-static mut LAST_SAMPLE_TIME: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(1, 0);
 
 #[map(name = "STACK_TRACES")]
 static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_STORAGE_SIZE as u32, 0);
@@ -44,7 +39,7 @@ static CONFIG: Config = Config {
     target_tgid: 0,
     min_block_us: 0,
     max_block_us: 0,
-    sample_interval_ns: 0,
+    sample_threshold: 0,
     stack_storage_size: 0,
 };
 
@@ -110,37 +105,14 @@ unsafe fn try_jbm(ctx: ProbeContext) -> Result<u32, i64> {
         (*stats).eligible_duration_us += offtime;
     }
 
-    // Rate limit before stack collection, perf-buffer output, and signal
-    // delivery. This is the authoritative limiter: rejecting the matching
-    // signal later would leave an emitted BPF event without its JVM stack.
-    // A BPF_NOEXIST insertion is an atomic, non-spinning try-lock across
-    // CPUs. Hold it only while checking and updating the global timestamp;
-    // expensive stack collection and signal delivery happen after release.
-    // A contended attempt is conservatively skipped and counted separately.
-    let sample_key: u32 = 0;
-    if RATE_LIMIT_LOCK
-        .insert(&sample_key, &1, BPF_NOEXIST as u64)
-        .is_err()
-    {
+    // Select each qualifying completed interval independently before collecting
+    // stacks or sending a signal. No cross-CPU admission lock is required.
+    if (bpf_get_prandom_u32() as u64) >= config.sample_threshold {
         if let Some(stats) = STATS.get_ptr_mut(0) {
-            (*stats).limiter_contention += 1;
+            (*stats).probability_rejections += 1;
         }
         return Ok(0);
     }
-    let too_soon = LAST_SAMPLE_TIME.get(&sample_key).is_some_and(|last_sample_time| {
-        t_end <= *last_sample_time || t_end - *last_sample_time < config.sample_interval_ns
-    });
-    if too_soon {
-        let _ = RATE_LIMIT_LOCK.remove(&sample_key);
-        if let Some(stats) = STATS.get_ptr_mut(0) {
-            (*stats).interval_rejections += 1;
-        }
-        return Ok(0);
-    }
-    let update_result = LAST_SAMPLE_TIME.insert(&sample_key, &t_end, 0);
-    let unlock_result = RATE_LIMIT_LOCK.remove(&sample_key);
-    update_result?;
-    unlock_result?;
     if let Some(stats) = STATS.get_ptr_mut(0) {
         (*stats).selected_intervals += 1;
     }

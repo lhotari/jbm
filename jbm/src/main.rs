@@ -9,7 +9,6 @@ use std::future::Future;
 use std::io::{BufWriter, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
 use tokio::signal;
 
 const DEFAULT_ASYNC_PROFILER_BIN: &str = "./async-profiler/build/bin/asprof";
@@ -45,12 +44,10 @@ struct Cli {
     /// Directory visible at the same path in the collector and target namespaces.
     #[arg(long)]
     async_profiler_stream_dir: Option<String>,
-    /// Minimum interval between samples accepted from blocking events.
-    ///
-    /// This rate limits stack collection, event output, and JVM stack walking
-    /// independently of min-block-time, which selects qualifying events.
-    #[arg(long, default_value = "10ms", value_parser = parse_duration)]
-    sample_interval: Duration,
+    /// Probability of capturing each event that passes the blocking-duration filter.
+    /// Capture volume scales with the workload; this is not a rate ceiling.
+    #[arg(long, default_value = "0.001", value_parser = parse_probability)]
+    sample_probability: f64,
 }
 
 #[tokio::main]
@@ -63,13 +60,13 @@ async fn main() -> Result<(), anyhow::Error> {
         target_tgid: cli.pid,
         min_block_us: cli.min_block_time,
         max_block_us: cli.max_block_time,
-        sample_interval_ns: cli
-            .sample_interval
-            .as_nanos()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("sample interval is too large"))?,
+        sample_threshold: (cli.sample_probability * 4_294_967_296.0) as u64,
         stack_storage_size: cli.stack_storage_size,
     };
+
+    info!("Event sampling: requested_probability={}, threshold={}, effective_probability={}",
+        cli.sample_probability, config.sample_threshold,
+        config.sample_threshold as f64 / 4_294_967_296.0);
 
     let async_profiler = AsyncProfilerStackTraceProvider::start(
         config.target_tgid,
@@ -229,12 +226,12 @@ fn collapsed_frame(frame: &str) -> String {
         .collect()
 }
 
-fn parse_duration(value: &str) -> Result<Duration, String> {
-    let duration = humantime::parse_duration(value).map_err(|error| error.to_string())?;
-    if duration.is_zero() {
-        return Err("duration must be positive".to_string());
+fn parse_probability(value: &str) -> Result<f64, String> {
+    let probability = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+        return Err("sample probability must be a finite number between 0 and 1".to_string());
     }
-    Ok(duration)
+    Ok(probability)
 }
 
 fn has_done<F: Future<Output = std::io::Result<()>>>(f: Pin<&mut F>) -> bool {
@@ -248,6 +245,18 @@ fn has_done<F: Future<Output = std::io::Result<()>>>(f: Pin<&mut F>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn validates_probability() {
+        for value in ["NaN", "inf", "-0.1", "1.001", "invalid"] {
+            assert!(parse_probability(value).is_err());
+        }
+        for (value, expected) in [("0", 0), ("0.5", 2_147_483_648), ("1", 4_294_967_296)] {
+            let threshold = (parse_probability(value).unwrap() * 4_294_967_296.0) as u64;
+            assert_eq!(threshold, expected);
+        }
+    }
 
     #[test]
     fn renders_duration_weighted_collapsed_stack() {
